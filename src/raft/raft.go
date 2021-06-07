@@ -31,7 +31,7 @@ import (
 	"6.824/labrpc"
 )
 
-type State int
+type State int32
 
 const (
 	Follower State = iota
@@ -84,7 +84,7 @@ type Raft struct {
 	peerId      string
 	currentTerm int    // latest term server has seen (initialized to 0 on first boot, increases monotonically)
 	votedFor    string // peerId that received vote in current term (or null if none)
-	state       State  // the leader peer index into peers
+	state       *State  // the leader peer index into peers
 
 	log []Log
 
@@ -103,6 +103,14 @@ type Log struct {
 	Term  int
 }
 
+func (rf *Raft) getState() State {
+	return State(atomic.LoadInt32((*int32)(rf.state)))
+}
+
+func (rf *Raft) setState(state State) {
+	atomic.StoreInt32((*int32)(rf.state), int32(state))
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -113,7 +121,7 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term = rf.currentTerm
-	isleader = rf.state == Leader
+	isleader = rf.getState() == Leader
 	return term, isleader
 }
 
@@ -204,8 +212,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-	defer rf.mu.Lock()
-	log.Printf("peer %v receive vote request from %v", rf.peerId, args.CandidateId)
+	defer rf.mu.Unlock()
 	reply.VoterId = rf.peerId
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -221,7 +228,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		// set voteFor
 		rf.votedFor = args.CandidateId
-		log.Printf("peer %v elect peer %v as leader", rf.peerId, args.CandidateId)
+		log.Printf("peer %v elect peer %v as leader\n", rf.peerId, args.CandidateId)
 	}
 	return
 }
@@ -229,7 +236,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) stepDownToFollower(term int) {
 	rf.currentTerm = term
 	rf.votedFor = ""
-	rf.state = Follower
+	rf.setState(Follower)
+	log.Printf("peer %v step down to follower", rf.peerId)
 }
 
 //
@@ -261,9 +269,8 @@ func (rf *Raft) stepDownToFollower(term int) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	log.Printf("peer %v request vote to peer %v", rf.peerId, reply.VoterId)
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply);
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, voteCount *int32) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	log.Printf("peer %v request vote to peer %v result %v", rf.peerId, reply.VoterId, reply)
 	if !ok {
 		return ok
@@ -271,11 +278,18 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.state != Candidate || args.Term != rf.currentTerm {
+	if rf.getState() != Candidate || args.Term != rf.currentTerm {
 		return ok
 	}
 	if reply.Term > rf.currentTerm {
 		rf.stepDownToFollower(reply.Term)
+	}
+	if reply.VoteGranted {
+		atomic.AddInt32(voteCount, 1)
+	}
+	if int(atomic.LoadInt32(voteCount)) > len(rf.peers)/2 {
+		rf.setState(Leader)
+		rf.electAsLeaderCh <- true
 	}
 	return ok
 }
@@ -337,34 +351,24 @@ func (rf *Raft) leaderElection() {
 	}
 	rf.mu.Unlock()
 	replyCh := make(chan bool, len(rf.peers))
+	var votedCount int32
 	for i := range rf.peers {
+		//if i == rf.me {
+		//	continue
+		//}
 		go func(index int) {
-			ok := rf.sendRequestVote(index, req, &RequestVoteReply{})
+			ok := rf.sendRequestVote(index, req, &RequestVoteReply{}, &votedCount)
 			replyCh <- ok
 		}(i)
-	}
-	votedCount := 0
-	for {
-		reply := <-replyCh
-		if reply == true {
-			votedCount++
-		}
-		if votedCount >= len(rf.peers) +1 {
-			rf.electAsLeaderCh <- true
-			return
-		}
 	}
 }
 
 func (rf *Raft) randomElectionTimeout() time.Duration {
-	return time.Millisecond * time.Duration(rand.Intn(200) + 300)
+	return time.Millisecond * time.Duration(rand.Intn(150) + 150) + rf.electionTimeout
 }
 
 func (rf *Raft) getLastLog() *Log {
-	lastLog := Log{
-		Index: 0,
-		Term:  0,
-	}
+	lastLog := Log{}
 	if len(rf.log) > 0 {
 		lastLog = rf.log[len(rf.log)-1]
 	}
@@ -381,6 +385,9 @@ func (rf *Raft) sendHeartbeat() {
 	}
 	rf.mu.Unlock()
 	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
 		go rf.sendAppendEntries(i, req, &AppendEntriesReply{})
 	}
 }
@@ -410,7 +417,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.state != Leader || args.Term != rf.currentTerm {
+	if rf.getState() != Leader || args.Term != rf.currentTerm {
 		return ok
 	}
 
@@ -440,11 +447,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) runServer() {
 	for !rf.killed() {
-		log.Printf("peer %v state is %v", rf.peerId, rf.state)
-		rf.mu.Lock()
-		state := rf.state
-		rf.mu.Unlock()
-		switch state {
+		switch rf.getState() {
 		case Leader:
 			rf.sendHeartbeat()
 			time.Sleep(rf.heartBeatInterval)
@@ -454,7 +457,7 @@ func (rf *Raft) runServer() {
 			case <-rf.grantCh:
 			case <-time.After(rf.randomElectionTimeout()):
 				log.Printf("peer %v step to candiate", rf.peerId)
-				rf.state = Candidate
+				rf.setState(Candidate)
 			}
 		case Candidate:
 			rf.mu.Lock()
@@ -462,12 +465,13 @@ func (rf *Raft) runServer() {
 			rf.votedFor = rf.peerId
 			rf.persist()
 			rf.mu.Unlock()
-			rf.leaderElection()
+			go rf.leaderElection()
 			select {
 			case <- time.After(rf.randomElectionTimeout()):
+				log.Printf("peer %v elect leader timeout", rf.peerId)
 			case <-rf.heartBeatCh:
 			case <- rf.electAsLeaderCh:
-				rf.state = Leader
+				rf.setState(Leader)
 				log.Printf("peer %v step to leader", rf.peerId)
 			}
 		}
@@ -494,14 +498,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.mu = sync.Mutex{}
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.state = Follower
+	state := Follower
+	rf.state = &state
 	rf.currentTerm = 0
 	rf.votedFor = ""
 	rf.log = make([]Log, 0)
 	rf.heartBeatCh = make(chan bool)
 	rf.grantCh = make(chan bool)
-	rf.heartBeatInterval = time.Millisecond * 120
-	//rf.electionTimeout = 2 * rf.heartBeatInterval
+	rf.heartBeatInterval = time.Millisecond * 150
+	rf.electionTimeout = 2 * rf.heartBeatInterval
 	rf.electAsLeaderCh = make(chan bool)
 	rf.peerId = strconv.Itoa(rf.me)
 
