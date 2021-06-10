@@ -225,6 +225,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	lastLog := rf.getLastLog()
 	if (rf.votedFor == "" || rf.votedFor == args.CandidateId) && (lastLog.Index <= args.LastLogIndex && lastLog.Term <= args.LastLogTerm) {
 		reply.Term = rf.currentTerm
+		rf.grantCh <- true
 		reply.VoteGranted = true
 		// set voteFor
 		rf.votedFor = args.CandidateId
@@ -351,11 +352,11 @@ func (rf *Raft) leaderElection() {
 	}
 	rf.mu.Unlock()
 	replyCh := make(chan bool, len(rf.peers))
-	var votedCount int32
+	var votedCount int32 = 1
 	for i := range rf.peers {
-		//if i == rf.me {
-		//	continue
-		//}
+		if i == rf.me {
+			continue
+		}
 		go func(index int) {
 			ok := rf.sendRequestVote(index, req, &RequestVoteReply{}, &votedCount)
 			replyCh <- ok
@@ -470,7 +471,7 @@ func (rf *Raft) runServer() {
 			case <- time.After(rf.randomElectionTimeout()):
 				log.Printf("peer %v elect leader timeout", rf.peerId)
 			case <-rf.heartBeatCh:
-			case <- rf.electAsLeaderCh:
+			case <-rf.electAsLeaderCh:
 				rf.setState(Leader)
 				log.Printf("peer %v step to leader", rf.peerId)
 			}
