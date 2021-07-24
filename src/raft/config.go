@@ -156,6 +156,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 // contents
 func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 	for m := range applyCh {
+		//DPrintf("peer=%v msg=%v", i, m)
 		if m.CommandValid == false {
 			// ignore other types of ApplyMsg
 		} else {
@@ -533,6 +534,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 						return index
 					}
 				}
+				//DPrintf("nd=%v expect_cmd=%v actual_cmd=%v index=%v", nd, cmd, cmd1, index)
 				time.Sleep(20 * time.Millisecond)
 			}
 			if retry == false {
